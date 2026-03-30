@@ -1,0 +1,9 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+# Runs every 3 hours at :05 past the hour (gives CMEMS time to update after 00Z/03Z/06Z runs)
+cronSchedule = "5 */3 * * *"
+startCommand = "python fetcher.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
