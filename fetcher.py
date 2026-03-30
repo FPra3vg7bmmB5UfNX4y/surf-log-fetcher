@@ -231,6 +231,7 @@ def fetch_tides() -> list[dict]:
             "heights": True, "extremes": True,
             "lat": LAT_PT, "lon": LON_PT,
             "days": 2, "step": 900,
+            "datum": "LAT",   # heights above Lowest Astronomical Tide (≥ 0, matches tide tables)
             "key": WORLDTIDES_KEY,
         },
         timeout=30,
