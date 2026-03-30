@@ -59,7 +59,7 @@ def sb_headers():
 
 def sb_upsert(table: str, rows: list[dict]):
     r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{table}",
+        f"{SUPABASE_URL}/rest/v1/{table}?on_conflict=valid_at",
         headers={**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
         json=rows,
         timeout=30,
