@@ -25,6 +25,11 @@ import cfgrib
 import xarray as xr
 import tempfile
 
+# xarray ≥ 2024.x changed the default compat for merge from 'no_conflicts' to
+# 'override'. cfgrib still uses the old default and emits a FutureWarning that
+# becomes a hard error in some xarray builds. Opt in to the new behaviour now.
+xr.set_options(use_new_combine_kwarg_defaults=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
