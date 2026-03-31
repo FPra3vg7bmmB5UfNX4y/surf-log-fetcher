@@ -160,63 +160,51 @@ def fetch_windy_wind() -> dict | None:
         log.warning("WINDY_STATIONS_KEY not set — skipping live wind fetch")
         return None
 
-    log.info(f"WINDY_STATIONS_KEY present (len={len(WINDY_STATIONS_KEY)})")
-    log.info("Fetching Windy Stations list…")
+    # Single call: find nearest station and its latest observation together
+    log.info("Fetching nearest Windy station observation…")
     r = requests.get(
-        "https://stations.windy.com/api/v2/stations",
-        params={"api-key": WINDY_STATIONS_KEY},
+        "https://stations.windy.com/api/v2/pws/nearest",
+        params={
+            "api-key": WINDY_STATIONS_KEY,
+            "lat":     LAT_PT,
+            "lon":     LON_PT,
+            "radius":  50,  # km
+        },
         timeout=30,
     )
-    log.info(f"  Stations list HTTP {r.status_code}")
+    log.info(f"  HTTP {r.status_code}")
     r.raise_for_status()
-    stations = r.json()
-    log.info(f"  Raw response type={type(stations).__name__}, "
-             f"len={len(stations) if isinstance(stations, list) else 'n/a'}")
+    data = r.json()
+    log.info(f"  Raw response: {str(data)[:400]}")
 
-    if not stations:
-        log.warning("  Windy returned empty station list")
-        return None
-
-    # Find nearest station with lat/lon
-    valid = [s for s in stations if s.get("lat") is not None and s.get("lon") is not None]
-    log.info(f"  {len(stations)} stations total, {len(valid)} with coordinates")
-    if not valid:
-        log.warning("  No stations with coordinates returned")
-        return None
-
-    nearest = min(valid, key=lambda s: _haversine_km(LAT_PT, LON_PT, s["lat"], s["lon"]))
-    dist_km = _haversine_km(LAT_PT, LON_PT, nearest["lat"], nearest["lon"])
-    log.info(f"  Nearest station: {nearest.get('name', '?')} (id={nearest['id']}) "
-             f"at {nearest['lat']:.4f},{nearest['lon']:.4f} — {dist_km:.1f} km away")
-
-    log.info(f"  Fetching latest observation for station {nearest['id']}…")
-    r2 = requests.get(
-        f"https://stations.windy.com/api/v2/stations/{nearest['id']}/observations/latest",
-        params={"api-key": WINDY_STATIONS_KEY},
-        timeout=30,
-    )
-    log.info(f"  Observation HTTP {r2.status_code}")
-    r2.raise_for_status()
-    obs = r2.json()
-    log.info(f"  Raw observation: {obs}")
-
-    # API may return a list or a single object
-    if isinstance(obs, list):
-        if not obs:
-            log.warning("  Windy latest observation is empty")
+    # Response may be a list of stations or a single object
+    if isinstance(data, list):
+        if not data:
+            log.warning("  Windy returned empty nearest-station list")
             return None
-        obs = obs[0]
+        data = data[0]
+
+    # Station metadata
+    station_name = data.get("name") or data.get("station", {}).get("name", "?")
+    station_lat  = data.get("lat") or data.get("station", {}).get("lat")
+    station_lon  = data.get("lon") or data.get("station", {}).get("lon")
+    if station_lat and station_lon:
+        dist_km = _haversine_km(LAT_PT, LON_PT, float(station_lat), float(station_lon))
+        log.info(f"  Station: {station_name} at {station_lat},{station_lon} — {dist_km:.1f} km away")
+
+    # Latest observation may be nested or at top level
+    obs = data.get("latest") or data.get("observation") or data
 
     wind_avg = obs.get("wind_avg")
     wind_max = obs.get("wind_max")
     wind_dir = obs.get("wind_direction") or obs.get("winddir") or obs.get("wd")
     obs_time = obs.get("time") or obs.get("dt")
 
-    log.info(f"  Parsed fields — wind_avg={wind_avg}, wind_max={wind_max}, "
+    log.info(f"  Parsed — wind_avg={wind_avg}, wind_max={wind_max}, "
              f"wind_dir={wind_dir}, obs_time={obs_time}")
 
     if wind_avg is None or wind_dir is None:
-        log.warning(f"  Windy observation missing wind fields. Available keys: {list(obs.keys())}")
+        log.warning(f"  Missing wind fields. Available keys: {list(obs.keys())}")
         return None
 
     result = {
@@ -314,10 +302,6 @@ def main():
     log.info(f"Run time: {datetime.now(timezone.utc).isoformat()}")
     log.info("=" * 60)
 
-    # Dump all env var names (not values) so we can confirm what Railway passes in
-    env_keys = sorted(os.environ.keys())
-    log.info(f"Environment variables present ({len(env_keys)}): {', '.join(env_keys)}")
-    log.info(f"WINDY_STATIONS_KEY set: {WINDY_STATIONS_KEY is not None}")
 
     errors = []
 
