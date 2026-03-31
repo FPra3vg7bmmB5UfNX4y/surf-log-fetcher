@@ -57,6 +57,8 @@ def sb_upsert(table: str, rows: list[dict]):
         json=rows,
         timeout=30,
     )
+    if not r.ok:
+        log.error(f"  Supabase {r.status_code} on {table}: {r.text[:500]}")
     r.raise_for_status()
     log.info(f"  → upserted {len(rows)} rows into {table}")
 
@@ -205,6 +207,21 @@ def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
     log.info(f"  → {len(rows)} tide rows from DB")
     return rows
 
+# ─── Sanitise ────────────────────────────────────────────────────────────────
+def sanitise_row(row: dict) -> dict:
+    """
+    Clamp and round wind fields to fit numeric(5,1) (max 9999.9).
+    Guards against occasional Open-Meteo outlier values.
+    """
+    out = dict(row)
+    if out.get("wind_speed") is not None:
+        out["wind_speed"]     = round(min(float(out["wind_speed"]),     200.0), 1)
+    if out.get("wind_gusts") is not None:
+        out["wind_gusts"]     = round(min(float(out["wind_gusts"]),     200.0), 1)
+    if out.get("wind_direction") is not None:
+        out["wind_direction"] = round(min(float(out["wind_direction"]), 360.0), 1)
+    return out
+
 # ─── Merge & upsert ──────────────────────────────────────────────────────────
 def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict]):
     """Merge CMEMS + Open-Meteo wind + tides by valid_at, upsert to conditions table."""
@@ -228,6 +245,7 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         tide = nearest_tide(ts)
         merged.append({**row, **wind, **tide})
 
+    merged = [sanitise_row(r) for r in merged]
     log.info(f"Upserting {len(merged)} rows to Supabase conditions table…")
     for i in range(0, len(merged), 50):
         sb_upsert("conditions", merged[i:i+50])
