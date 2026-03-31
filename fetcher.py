@@ -79,6 +79,7 @@ CMEMS_VARS = [
 def fetch_cmems() -> list[dict]:
     """Pull next 10 days of CMEMS wave forecast, return list of dicts."""
     now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=3)   # include one past row so conditions table always has a current entry
     end = now + timedelta(days=10)
 
     log.info("Fetching CMEMS wave forecast…")
@@ -89,7 +90,7 @@ def fetch_cmems() -> list[dict]:
         maximum_longitude=LON_MAX,
         minimum_latitude=LAT_MIN,
         maximum_latitude=LAT_MAX,
-        start_datetime=now.strftime("%Y-%m-%dT%H:%M:%S"),
+        start_datetime=start.strftime("%Y-%m-%dT%H:%M:%S"),
         end_datetime=end.strftime("%Y-%m-%dT%H:%M:%S"),
         username=CMEMS_USER,
         password=CMEMS_PASS,
