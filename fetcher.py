@@ -246,6 +246,12 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         merged.append({**row, **wind, **tide})
 
     merged = [sanitise_row(r) for r in merged]
+
+    # Ensure every row has identical keys (PGRST102 requires uniform shape).
+    # Take the union of all keys and fill gaps with None.
+    all_keys = set().union(*[r.keys() for r in merged])
+    merged = [{k: r.get(k) for k in all_keys} for r in merged]
+
     log.info(f"Upserting {len(merged)} rows to Supabase conditions table…")
     for i in range(0, len(merged), 50):
         sb_upsert("conditions", merged[i:i+50])
