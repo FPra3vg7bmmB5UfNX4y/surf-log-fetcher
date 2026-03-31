@@ -1,18 +1,17 @@
 """
-Peniche Surf Log — CMEMS + Windy Stations Data Fetcher
-=======================================================
+Peniche Surf Log — CMEMS + Open-Meteo Data Fetcher
+===================================================
 Runs every 3 hours via Railway cron (or any scheduler).
-Pulls CMEMS swell data + Windy Stations live wind, upserts to Supabase.
+Pulls CMEMS swell data + Open-Meteo wind forecast, upserts to Supabase.
 
 Data sources:
-  - CMEMS GLOBAL_ANALYSISFORECAST_WAV_001_027 (swell1, swell2, wind wave, wind direction forecast)
-  - Windy Stations API (live wind_speed, wind_gusts, wind_direction — applied to current row)
+  - CMEMS GLOBAL_ANALYSISFORECAST_WAV_001_027 (swell1, swell2, wind wave)
+  - Open-Meteo forecast API (wind_speed, wind_direction, wind_gusts — no auth needed)
   - WorldTides API (tide height, phase) — pre-fetched annually into Supabase tides table
 
 Requirements: see requirements.txt
 """
 
-import math
 import os
 import sys
 import logging
@@ -30,15 +29,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-# These come from Railway environment variables (or your .env file locally)
-
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 CMEMS_USER = os.environ["COPERNICUSMARINE_SERVICE_USERNAME"]
 CMEMS_PASS = os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"]
-
-WINDY_STATIONS_KEY = os.environ.get("WINDY_STATIONS_KEY")  # optional
 
 # Peniche area bounding box — slightly wider for interpolation accuracy
 LAT_PT  = 39.3557
@@ -76,7 +71,6 @@ CMEMS_VARS = [
     "VMDR_SW2",
     "VHM0_WW",    # significant height of wind waves (m)
     "VTM01_WW",   # mean wave period of wind waves (s)
-    "VMDR_WW",    # mean direction of wind waves (degrees) — wind direction forecast proxy
     "VHM0",       # combined significant wave height (m)
 ]
 
@@ -136,86 +130,51 @@ def fetch_cmems() -> list[dict]:
             "wind_wave_height": v("VHM0_WW"),
             "wind_wave_period": v("VTM01_WW"),
             "wave_height_total":v("VHM0"),
-            "wind_direction":   v("VMDR_WW"),
         })
 
     log.info(f"  → {len(rows)} CMEMS time steps from {rows[0]['valid_at']} to {rows[-1]['valid_at']}")
     return rows
 
-# ─── Windy Stations live wind ─────────────────────────────────────────────────
-def _haversine_km(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.asin(math.sqrt(a))
-
-def fetch_windy_wind() -> dict | None:
+# ─── Open-Meteo wind ─────────────────────────────────────────────────────────
+def fetch_openmeteo_wind() -> dict[str, dict]:
     """
-    Fetch latest wind observation from the nearest Windy public station to Peniche.
-    Returns {wind_speed, wind_gusts, wind_direction, observed_at} or None on failure.
-    Converts knots → km/h (× 1.852).
+    Fetch 10-day hourly wind forecast from Open-Meteo (no auth required).
+    Returns dict keyed by UTC ISO hour string → {wind_speed, wind_direction, wind_gusts}.
     """
-    if not WINDY_STATIONS_KEY:
-        log.warning("WINDY_STATIONS_KEY not set — skipping live wind fetch")
-        return None
-
-    # Single call: find nearest station and its latest observation together
-    log.info("Fetching nearest Windy station observation…")
+    log.info("Fetching Open-Meteo wind forecast…")
     r = requests.get(
-        "https://stations.windy.com/api/v2/pws/nearest",
+        "https://api.open-meteo.com/v1/forecast",
         params={
-            "api-key": WINDY_STATIONS_KEY,
-            "lat":     LAT_PT,
-            "lon":     LON_PT,
-            "radius":  50,  # km
+            "latitude":        LAT_PT,
+            "longitude":       LON_PT,
+            "hourly":          "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+            "wind_speed_unit": "kmh",
+            "forecast_days":   10,
+            "timezone":        "UTC",
         },
         timeout=30,
     )
-    log.info(f"  HTTP {r.status_code}")
     r.raise_for_status()
     data = r.json()
-    log.info(f"  Raw response: {str(data)[:400]}")
 
-    # Response may be a list of stations or a single object
-    if isinstance(data, list):
-        if not data:
-            log.warning("  Windy returned empty nearest-station list")
-            return None
-        data = data[0]
+    hourly = data["hourly"]
+    times  = hourly["time"]           # "2026-03-31T06:00" — no tz suffix
+    speeds = hourly["wind_speed_10m"]
+    dirs   = hourly["wind_direction_10m"]
+    gusts  = hourly["wind_gusts_10m"]
 
-    # Station metadata
-    station_name = data.get("name") or data.get("station", {}).get("name", "?")
-    station_lat  = data.get("lat") or data.get("station", {}).get("lat")
-    station_lon  = data.get("lon") or data.get("station", {}).get("lon")
-    if station_lat and station_lon:
-        dist_km = _haversine_km(LAT_PT, LON_PT, float(station_lat), float(station_lon))
-        log.info(f"  Station: {station_name} at {station_lat},{station_lon} — {dist_km:.1f} km away")
+    wind_map = {}
+    for t, spd, d, g in zip(times, speeds, dirs, gusts):
+        # Normalise to UTC ISO with +00:00 so it matches CMEMS valid_at keys
+        key = t + ":00+00:00"
+        wind_map[key] = {
+            "wind_speed":     round(float(spd), 1) if spd is not None else None,
+            "wind_direction": round(float(d), 1)   if d   is not None else None,
+            "wind_gusts":     round(float(g), 1)   if g   is not None else None,
+        }
 
-    # Latest observation may be nested or at top level
-    obs = data.get("latest") or data.get("observation") or data
-
-    wind_avg = obs.get("wind_avg")
-    wind_max = obs.get("wind_max")
-    wind_dir = obs.get("wind_direction") or obs.get("winddir") or obs.get("wd")
-    obs_time = obs.get("time") or obs.get("dt")
-
-    log.info(f"  Parsed — wind_avg={wind_avg}, wind_max={wind_max}, "
-             f"wind_dir={wind_dir}, obs_time={obs_time}")
-
-    if wind_avg is None or wind_dir is None:
-        log.warning(f"  Missing wind fields. Available keys: {list(obs.keys())}")
-        return None
-
-    result = {
-        "wind_speed":     round(float(wind_avg) * 1.852, 1),
-        "wind_gusts":     round(float(wind_max) * 1.852, 1) if wind_max is not None else None,
-        "wind_direction": round(float(wind_dir), 1),
-        "observed_at":    obs_time,
-    }
-    log.info(f"  → wind {result['wind_speed']} km/h from {result['wind_direction']}° "
-             f"(gusts {result['wind_gusts']} km/h)")
-    return result
+    log.info(f"  → {len(wind_map)} Open-Meteo wind time steps")
+    return wind_map
 
 # ─── Tides from Supabase ─────────────────────────────────────────────────────
 def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
@@ -247,10 +206,10 @@ def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
     return rows
 
 # ─── Merge & upsert ──────────────────────────────────────────────────────────
-def merge_and_upsert(cmems_rows: list[dict], tide_rows: list[dict], windy_wind: dict | None):
-    """Merge CMEMS + tides + Windy live wind by valid_at, upsert to conditions table."""
+def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict]):
+    """Merge CMEMS + Open-Meteo wind + tides by valid_at, upsert to conditions table."""
 
-    # Build tide lookup: nearest tide height to each timestamp
+    # Build tide lookup: nearest tide to each timestamp
     def nearest_tide(ts_iso: str) -> dict:
         if not tide_rows:
             return {}
@@ -258,40 +217,18 @@ def merge_and_upsert(cmems_rows: list[dict], tide_rows: list[dict], windy_wind: 
         best = min(tide_rows, key=lambda r: abs(datetime.fromisoformat(r["valid_at"]).timestamp() - target))
         return {k: best[k] for k in ["tide_height","tide_state","tide_phase","tide_next_type","tide_next_height"]}
 
-    # Determine which CMEMS row gets the Windy live wind overlay
-    windy_apply_ts = None
-    if windy_wind:
-        obs_time = windy_wind.get("observed_at")
-        if obs_time is not None:
-            try:
-                target_unix = datetime.fromtimestamp(float(obs_time), tz=timezone.utc).timestamp()
-            except Exception:
-                target_unix = datetime.now(timezone.utc).timestamp()
-        else:
-            target_unix = datetime.now(timezone.utc).timestamp()
-
-        nearest_row = min(
-            cmems_rows,
-            key=lambda r: abs(datetime.fromisoformat(r["valid_at"]).timestamp() - target_unix),
-        )
-        windy_apply_ts = nearest_row["valid_at"]
-        log.info(f"  Windy wind will be applied to CMEMS row: {windy_apply_ts}")
-
     merged = []
     for row in cmems_rows:
-        ts = row["valid_at"]
+        ts = row["valid_at"]  # e.g. "2026-03-31T06:00:00+00:00"
+
+        # Match to Open-Meteo hour: CMEMS steps are 3h, Open-Meteo is 1h,
+        # so exact key hit is expected; fall back to truncating minutes.
+        wind = wind_map.get(ts) or wind_map.get(ts[:13] + ":00+00:00", {})
+
         tide = nearest_tide(ts)
-        wind_overlay = {}
-        if windy_wind and ts == windy_apply_ts:
-            wind_overlay = {
-                "wind_speed":     windy_wind["wind_speed"],
-                "wind_gusts":     windy_wind["wind_gusts"],
-                "wind_direction": windy_wind["wind_direction"],
-            }
-        merged.append({**row, **tide, **wind_overlay})
+        merged.append({**row, **wind, **tide})
 
     log.info(f"Upserting {len(merged)} rows to Supabase conditions table…")
-    # Upsert in batches of 50 to stay within Supabase request limits
     for i in range(0, len(merged), 50):
         sb_upsert("conditions", merged[i:i+50])
 
@@ -302,7 +239,6 @@ def main():
     log.info(f"Run time: {datetime.now(timezone.utc).isoformat()}")
     log.info("=" * 60)
 
-
     errors = []
 
     try:
@@ -312,12 +248,12 @@ def main():
         errors.append(f"CMEMS: {e}")
         cmems_rows = []
 
-    windy_wind = None
+    wind_map = {}
     try:
-        windy_wind = fetch_windy_wind()
+        wind_map = fetch_openmeteo_wind()
     except Exception as e:
-        log.error(f"Windy Stations fetch failed: {e}")
-        # Not critical — conditions will be upserted without live wind speed
+        log.error(f"Open-Meteo fetch failed: {e}")
+        # Not critical — conditions will be upserted without wind columns
 
     tide_rows = []
     if cmems_rows:
@@ -329,7 +265,7 @@ def main():
 
     if cmems_rows:
         try:
-            merge_and_upsert(cmems_rows, tide_rows, windy_wind)
+            merge_and_upsert(cmems_rows, wind_map, tide_rows)
         except Exception as e:
             log.error(f"Supabase upsert failed: {e}")
             errors.append(f"Supabase: {e}")
