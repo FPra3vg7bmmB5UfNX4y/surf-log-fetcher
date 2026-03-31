@@ -229,27 +229,14 @@ def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
     log.info("Reading tides from Supabase…")
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/tides"
-        f"?select=valid_at,height,state,phase,next_type,next_height"
+        f"?select=valid_at,tide_height,tide_state,tide_phase,tide_next_type,tide_next_height"
         f"&valid_at=gte.{start_dt}&valid_at=lte.{end_dt}"
         f"&order=valid_at.asc&limit=5000",
         headers=sb_headers(),
         timeout=30,
     )
     r.raise_for_status()
-    raw = r.json()
-
-    # Rename columns to match the keys merge_and_upsert expects
-    rows = [
-        {
-            "valid_at":        row["valid_at"],
-            "tide_height":     row["height"],
-            "tide_state":      row["state"],
-            "tide_phase":      row["phase"],
-            "tide_next_type":  row["next_type"],
-            "tide_next_height":row["next_height"],
-        }
-        for row in raw
-    ]
+    rows = r.json()
     log.info(f"  → {len(rows)} tide rows from DB")
     return rows
 

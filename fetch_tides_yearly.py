@@ -1,15 +1,19 @@
 """
-Peniche Surf Log — WorldTides Yearly Bulk Fetcher
-=================================================
-Run once per year (or whenever you want to refresh tide predictions).
-Fetches 365 days of tide heights and extremes from WorldTides at
-15-min resolution and upserts everything to the Supabase `tides` table.
+Peniche Surf Log — WorldTides Bulk Tide Fetcher
+================================================
+Fetches tide heights and extremes from WorldTides at 15-min resolution
+and upserts everything to the Supabase `tides` table.
 
 The main fetcher.py reads from this table instead of calling WorldTides
 on every 3h cron run, so the WorldTides API key is only needed here.
 
 Usage:
-    python fetch_tides_yearly.py
+    python fetch_tides_yearly.py           # default: 30 days
+    python fetch_tides_yearly.py --days 90 # more days (needs paid plan)
+
+Credit cost: ~2 credits per day requested (heights + extremes).
+Free tier:   10 credits/day  → max ~5 days per run
+Paid plan:   10 000 credits/day → 365 days in one call
 
 Required env vars:
     SUPABASE_URL, SUPABASE_KEY, WORLDTIDES_KEY
@@ -17,6 +21,7 @@ Required env vars:
 
 import os
 import sys
+import argparse
 import logging
 from datetime import datetime, timezone
 
@@ -57,12 +62,17 @@ def sb_upsert(rows: list[dict]):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days", type=int, default=30,
+                        help="Days of tide data to fetch (default 30; 365 needs paid WorldTides plan)")
+    args = parser.parse_args()
+
     log.info("=" * 60)
-    log.info("Peniche Surf Log — Yearly tide fetch")
+    log.info(f"Peniche Surf Log — Bulk tide fetch ({args.days} days)")
     log.info(f"Run time: {datetime.now(timezone.utc).isoformat()}")
     log.info("=" * 60)
 
-    log.info("Fetching WorldTides — 365 days at 15-min resolution, datum=LAT…")
+    log.info(f"Fetching WorldTides — {args.days} days at 15-min resolution, datum=LAT…")
     r = requests.get(
         "https://www.worldtides.info/api/v3",
         params={
@@ -70,7 +80,7 @@ def main():
             "extremes": True,
             "lat":  LAT_PT,
             "lon":  LON_PT,
-            "days": 365,
+            "days": args.days,
             "step": 900,
             "datum": "LAT",
             "key":  WORLDTIDES_KEY,
@@ -106,12 +116,12 @@ def main():
         next_ex = next((e for e in extremes if e["dt"] > ts), None)
 
         rows.append({
-            "valid_at":    valid.isoformat(),
-            "height":      round(h["height"], 3),
-            "state":       state,
-            "phase":       phase,
-            "next_type":   next_ex["type"] if next_ex else None,
-            "next_height": round(next_ex["height"], 3) if next_ex else None,
+            "valid_at":        valid.isoformat(),
+            "tide_height":     round(h["height"], 3),
+            "tide_state":      state,
+            "tide_phase":      phase,
+            "tide_next_type":  next_ex["type"] if next_ex else None,
+            "tide_next_height":round(next_ex["height"], 3) if next_ex else None,
         })
 
     log.info(f"Upserting {len(rows)} tide rows to Supabase in batches of 500…")
