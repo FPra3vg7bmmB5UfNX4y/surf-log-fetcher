@@ -157,17 +157,21 @@ def fetch_windy_wind() -> dict | None:
     Converts knots → km/h (× 1.852).
     """
     if not WINDY_STATIONS_KEY:
-        log.info("WINDY_STATIONS_KEY not set — skipping live wind fetch")
+        log.warning("WINDY_STATIONS_KEY not set — skipping live wind fetch")
         return None
 
+    log.info(f"WINDY_STATIONS_KEY present (len={len(WINDY_STATIONS_KEY)})")
     log.info("Fetching Windy Stations list…")
     r = requests.get(
         "https://stations.windy.com/api/v2/stations",
         params={"api-key": WINDY_STATIONS_KEY},
         timeout=30,
     )
+    log.info(f"  Stations list HTTP {r.status_code}")
     r.raise_for_status()
     stations = r.json()
+    log.info(f"  Raw response type={type(stations).__name__}, "
+             f"len={len(stations) if isinstance(stations, list) else 'n/a'}")
 
     if not stations:
         log.warning("  Windy returned empty station list")
@@ -175,6 +179,7 @@ def fetch_windy_wind() -> dict | None:
 
     # Find nearest station with lat/lon
     valid = [s for s in stations if s.get("lat") is not None and s.get("lon") is not None]
+    log.info(f"  {len(stations)} stations total, {len(valid)} with coordinates")
     if not valid:
         log.warning("  No stations with coordinates returned")
         return None
@@ -190,8 +195,10 @@ def fetch_windy_wind() -> dict | None:
         params={"api-key": WINDY_STATIONS_KEY},
         timeout=30,
     )
+    log.info(f"  Observation HTTP {r2.status_code}")
     r2.raise_for_status()
     obs = r2.json()
+    log.info(f"  Raw observation: {obs}")
 
     # API may return a list or a single object
     if isinstance(obs, list):
@@ -205,8 +212,11 @@ def fetch_windy_wind() -> dict | None:
     wind_dir = obs.get("wind_direction") or obs.get("winddir") or obs.get("wd")
     obs_time = obs.get("time") or obs.get("dt")
 
+    log.info(f"  Parsed fields — wind_avg={wind_avg}, wind_max={wind_max}, "
+             f"wind_dir={wind_dir}, obs_time={obs_time}")
+
     if wind_avg is None or wind_dir is None:
-        log.warning(f"  Windy observation missing wind fields: {list(obs.keys())}")
+        log.warning(f"  Windy observation missing wind fields. Available keys: {list(obs.keys())}")
         return None
 
     result = {
@@ -229,11 +239,16 @@ def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
     start_dt = (datetime.fromisoformat(start_iso) - timedelta(hours=2)).isoformat()
     end_dt   = (datetime.fromisoformat(end_iso)   + timedelta(hours=2)).isoformat()
 
+    # URL-encode the + in timezone offset (+00:00 → %2B00:00) so PostgREST
+    # doesn't interpret it as a space and reject the timestamp filter.
+    start_enc = start_dt.replace("+", "%2B")
+    end_enc   = end_dt.replace("+", "%2B")
+
     log.info("Reading tides from Supabase…")
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/tides"
         f"?select=valid_at,tide_height,tide_state,tide_phase,tide_next_type,tide_next_height"
-        f"&valid_at=gte.{start_dt}&valid_at=lte.{end_dt}"
+        f"&valid_at=gte.{start_enc}&valid_at=lte.{end_enc}"
         f"&order=valid_at.asc&limit=5000",
         headers=sb_headers(),
         timeout=30,
