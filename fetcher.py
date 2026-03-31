@@ -314,6 +314,11 @@ def main():
     log.info(f"Run time: {datetime.now(timezone.utc).isoformat()}")
     log.info("=" * 60)
 
+    # Dump all env var names (not values) so we can confirm what Railway passes in
+    env_keys = sorted(os.environ.keys())
+    log.info(f"Environment variables present ({len(env_keys)}): {', '.join(env_keys)}")
+    log.info(f"WINDY_STATIONS_KEY set: {WINDY_STATIONS_KEY is not None}")
+
     errors = []
 
     try:
