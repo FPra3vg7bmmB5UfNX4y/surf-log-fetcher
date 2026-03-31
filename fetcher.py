@@ -176,6 +176,9 @@ def fetch_openmeteo_wind() -> dict[str, dict]:
         }
 
     log.info(f"  → {len(wind_map)} Open-Meteo wind time steps")
+    if wind_map:
+        sample_key = next(iter(wind_map))
+        log.info(f"  Sample wind entry: {sample_key} → {wind_map[sample_key]}")
     return wind_map
 
 # ─── Tides from Supabase ─────────────────────────────────────────────────────
@@ -235,15 +238,24 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         return {k: best[k] for k in ["tide_height","tide_state","tide_phase","tide_next_type","tide_next_height"]}
 
     merged = []
+    wind_hits = 0
     for row in cmems_rows:
         ts = row["valid_at"]  # e.g. "2026-03-31T06:00:00+00:00"
 
         # Match to Open-Meteo hour: CMEMS steps are 3h, Open-Meteo is 1h,
-        # so exact key hit is expected; fall back to truncating minutes.
-        wind = wind_map.get(ts) or wind_map.get(ts[:13] + ":00+00:00", {})
+        # so exact key hit is expected; fall back to truncating minutes/seconds.
+        wind = wind_map.get(ts) or wind_map.get(ts[:13] + ":00:00+00:00", {})
+        if wind:
+            wind_hits += 1
 
         tide = nearest_tide(ts)
         merged.append({**row, **wind, **tide})
+
+    log.info(f"  Wind matched {wind_hits}/{len(cmems_rows)} CMEMS rows")
+    if merged:
+        first = merged[0]
+        log.info(f"  Sample merged row wind fields: speed={first.get('wind_speed')}, "
+                 f"dir={first.get('wind_direction')}, gusts={first.get('wind_gusts')}")
 
     merged = [sanitise_row(r) for r in merged]
 
