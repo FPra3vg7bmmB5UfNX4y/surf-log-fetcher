@@ -42,7 +42,6 @@ log = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-WORLDTIDES_KEY = os.environ.get("WORLDTIDES_KEY", "")  # optional
 
 CMEMS_USER = os.environ["COPERNICUSMARINE_SERVICE_USERNAME"]
 CMEMS_PASS = os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"]
@@ -217,66 +216,42 @@ def fetch_ecmwf_wind() -> dict[str, dict]:
     log.info(f"  → {len(result)} ECMWF wind time steps")
     return result
 
-# ─── WorldTides ──────────────────────────────────────────────────────────────
-def fetch_tides() -> list[dict]:
-    """Fetch 2 days of tide predictions from WorldTides, return list of dicts."""
-    if not WORLDTIDES_KEY:
-        log.info("No WorldTides key set — skipping tides")
-        return []
+# ─── Tides from Supabase ─────────────────────────────────────────────────────
+def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
+    """
+    Read pre-computed tide rows from the Supabase tides table.
+    Fetches the window covering the CMEMS forecast range plus a 2h buffer
+    so the nearest-match in merge_and_upsert always has data to pick from.
+    """
+    start_dt = (datetime.fromisoformat(start_iso) - timedelta(hours=2)).isoformat()
+    end_dt   = (datetime.fromisoformat(end_iso)   + timedelta(hours=2)).isoformat()
 
-    log.info("Fetching WorldTides…")
+    log.info("Reading tides from Supabase…")
     r = requests.get(
-        "https://www.worldtides.info/api/v3",
-        params={
-            "heights": True, "extremes": True,
-            "lat": LAT_PT, "lon": LON_PT,
-            "days": 2, "step": 900,
-            "datum": "LAT",   # heights above Lowest Astronomical Tide (≥ 0, matches tide tables)
-            "key": WORLDTIDES_KEY,
-        },
+        f"{SUPABASE_URL}/rest/v1/tides"
+        f"?select=valid_at,height,state,phase,next_type,next_height"
+        f"&valid_at=gte.{start_dt}&valid_at=lte.{end_dt}"
+        f"&order=valid_at.asc&limit=5000",
+        headers=sb_headers(),
         timeout=30,
     )
     r.raise_for_status()
-    d = r.json()
-    if d.get("status") != 200:
-        raise RuntimeError(f"WorldTides error: {d.get('error')}")
+    raw = r.json()
 
-    heights = d.get("heights", [])
-    extremes = d.get("extremes", [])
-    now_ts = datetime.now(timezone.utc).timestamp()
-
-    tide_rows = []
-    for h in heights:
-        ts = h["dt"]
-        valid = datetime.fromtimestamp(ts, tz=timezone.utc)
-
-        # State: rising or falling
-        idx = heights.index(h)
-        state = None
-        if 0 < idx < len(heights)-1:
-            state = "rising" if heights[idx+1]["height"] > heights[idx-1]["height"] else "falling"
-
-        # Phase: low / mid / high (within 1.5h of an extreme)
-        phase = "mid"
-        for ex in extremes:
-            if abs(ex["dt"] - ts) < 5400:
-                phase = ex["type"].lower()
-                break
-
-        # Next extreme
-        next_ex = next((e for e in extremes if e["dt"] > ts), None)
-
-        tide_rows.append({
-            "valid_at": valid.isoformat(),
-            "tide_height":    round(h["height"], 3),
-            "tide_state":     state,
-            "tide_phase":     phase,
-            "tide_next_type": next_ex["type"] if next_ex else None,
-            "tide_next_height": round(next_ex["height"], 3) if next_ex else None,
-        })
-
-    log.info(f"  → {len(tide_rows)} tide data points")
-    return tide_rows
+    # Rename columns to match the keys merge_and_upsert expects
+    rows = [
+        {
+            "valid_at":        row["valid_at"],
+            "tide_height":     row["height"],
+            "tide_state":      row["state"],
+            "tide_phase":      row["phase"],
+            "tide_next_type":  row["next_type"],
+            "tide_next_height":row["next_height"],
+        }
+        for row in raw
+    ]
+    log.info(f"  → {len(rows)} tide rows from DB")
+    return rows
 
 # ─── Merge & upsert ──────────────────────────────────────────────────────────
 def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict]):
@@ -333,11 +308,12 @@ def main():
         errors.append(f"ECMWF: {e}")
 
     tide_rows = []
-    try:
-        tide_rows = fetch_tides()
-    except Exception as e:
-        log.error(f"WorldTides fetch failed: {e}")
-        # Not critical — log and continue
+    if cmems_rows:
+        try:
+            tide_rows = fetch_tides_from_db(cmems_rows[0]["valid_at"], cmems_rows[-1]["valid_at"])
+        except Exception as e:
+            log.error(f"Tides DB fetch failed: {e}")
+            # Not critical — conditions will be upserted without tide columns
 
     if cmems_rows:
         try:
