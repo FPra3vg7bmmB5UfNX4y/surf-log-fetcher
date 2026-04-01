@@ -1,12 +1,14 @@
 """
-Peniche Surf Log — CMEMS + Open-Meteo Data Fetcher
-===================================================
+Peniche Surf Log — CMEMS + Open-Meteo + IPMA Data Fetcher
+==========================================================
 Runs every 3 hours via Railway cron (or any scheduler).
-Pulls CMEMS swell data + Open-Meteo wind forecast, upserts to Supabase.
+Pulls CMEMS swell data + Open-Meteo wind forecast + IPMA station obs,
+upserts to Supabase.
 
 Data sources:
   - CMEMS GLOBAL_ANALYSISFORECAST_WAV_001_027 (swell1, swell2, wind wave)
   - Open-Meteo forecast API (wind_speed, wind_direction, wind_gusts — no auth needed)
+  - IPMA station 1200535 Cabo Carvoeiro (wind_speed_obs, wind_dir_obs — observed, recent hours only)
   - WorldTides API (tide height, phase) — pre-fetched annually into Supabase tides table
 
 Requirements: see requirements.txt
@@ -138,6 +140,63 @@ def fetch_cmems() -> list[dict]:
     log.info(f"  → {len(rows)} CMEMS time steps from {rows[0]['valid_at']} to {rows[-1]['valid_at']}")
     return rows
 
+# ─── IPMA station observations ───────────────────────────────────────────────
+# Station 1200535 = Cabo Carvoeiro (nearest coastal station to Peniche, ~10 km N)
+IPMA_STATION_ID = "1200535"
+
+# IPMA idDireccVento codes → degrees (0 = calm/variable, 1–8 = N/NE/E/SE/S/SW/W/NW)
+IPMA_DIR_DEG = {
+    0: None,   # calm / variable — no meaningful direction
+    1: 0.0,    # N
+    2: 45.0,   # NE
+    3: 90.0,   # E
+    4: 135.0,  # SE
+    5: 180.0,  # S
+    6: 225.0,  # SW
+    7: 270.0,  # W
+    8: 315.0,  # NW
+    9: 0.0,    # N (some IPMA schemas repeat N as 9)
+}
+
+def fetch_ipma_obs() -> dict[str, dict]:
+    """
+    Fetch recent IPMA station observations for Cabo Carvoeiro (station 1200535).
+    Returns dict keyed by UTC ISO timestamp → {wind_speed_obs, wind_dir_obs, wind_gusts_obs}.
+    IPMA publishes only the last ~3 observation hours so this only populates
+    the most recent rows in the conditions table.
+    """
+    log.info("Fetching IPMA station observations…")
+    r = requests.get(
+        "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json",
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    obs_map = {}
+    for ts_str, stations in data.items():
+        station = stations.get(IPMA_STATION_ID)
+        if not station:
+            continue
+        # IPMA timestamps are "YYYY-MM-DDTHH:MM" — no tz suffix; treat as UTC
+        try:
+            dt = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+        except ValueError:
+            log.warning(f"  IPMA: unrecognised timestamp {ts_str!r}, skipping")
+            continue
+
+        speed_raw = station.get("intensidadeVentoKM")  # already km/h
+        dir_code  = station.get("idDireccVento")
+
+        obs_map[dt.isoformat()] = {
+            "wind_speed_obs": round(float(speed_raw), 1) if speed_raw is not None else None,
+            "wind_dir_obs":   IPMA_DIR_DEG.get(int(dir_code)) if dir_code is not None else None,
+            "wind_gusts_obs": None,  # IPMA hourly obs don't include a gust field
+        }
+
+    log.info(f"  → {len(obs_map)} IPMA observation time steps")
+    return obs_map
+
 # ─── Open-Meteo wind ─────────────────────────────────────────────────────────
 def fetch_openmeteo_wind() -> dict[str, dict]:
     """
@@ -224,11 +283,18 @@ def sanitise_row(row: dict) -> dict:
         out["wind_gusts"]     = round(min(float(out["wind_gusts"]),     200.0), 1)
     if out.get("wind_direction") is not None:
         out["wind_direction"] = round(min(float(out["wind_direction"]), 360.0), 1)
+    if out.get("wind_speed_obs") is not None:
+        out["wind_speed_obs"] = round(min(float(out["wind_speed_obs"]), 200.0), 1)
+    if out.get("wind_gusts_obs") is not None:
+        out["wind_gusts_obs"] = round(min(float(out["wind_gusts_obs"]), 200.0), 1)
+    if out.get("wind_dir_obs") is not None:
+        out["wind_dir_obs"]   = round(min(float(out["wind_dir_obs"]),   360.0), 1)
     return out
 
 # ─── Merge & upsert ──────────────────────────────────────────────────────────
-def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict]):
-    """Merge CMEMS + Open-Meteo wind + tides by valid_at, upsert to conditions table."""
+def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict],
+                     ipma_obs: dict):
+    """Merge CMEMS + Open-Meteo wind + IPMA obs + tides by valid_at, upsert to conditions table."""
 
     # Build tide lookup: nearest tide to each timestamp
     def nearest_tide(ts_iso: str) -> dict:
@@ -238,8 +304,18 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         best = min(tide_rows, key=lambda r: abs(datetime.fromisoformat(r["valid_at"]).timestamp() - target))
         return {k: best[k] for k in ["tide_height","tide_state","tide_phase","tide_next_type","tide_next_height"]}
 
+    def nearest_ipma(ts_iso: str) -> dict:
+        """Return IPMA obs for ts_iso only if within 1.5 h; else empty (no obs for future rows)."""
+        if not ipma_obs:
+            return {}
+        target = datetime.fromisoformat(ts_iso).timestamp()
+        best_key = min(ipma_obs.keys(), key=lambda k: abs(datetime.fromisoformat(k).timestamp() - target))
+        delta_h = abs(datetime.fromisoformat(best_key).timestamp() - target) / 3600
+        return ipma_obs[best_key] if delta_h <= 1.5 else {}
+
     merged = []
     wind_hits = 0
+    ipma_hits = 0
     for row in cmems_rows:
         ts = row["valid_at"]  # e.g. "2026-03-31T06:00:00+00:00"
 
@@ -249,14 +325,20 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         if wind:
             wind_hits += 1
 
+        obs = nearest_ipma(ts)
+        if obs:
+            ipma_hits += 1
+
         tide = nearest_tide(ts)
-        merged.append({**row, **wind, **tide})
+        merged.append({**row, **wind, **obs, **tide})
 
     log.info(f"  Wind matched {wind_hits}/{len(cmems_rows)} CMEMS rows")
+    log.info(f"  IPMA obs matched {ipma_hits}/{len(cmems_rows)} CMEMS rows")
     if merged:
         first = merged[0]
         log.info(f"  Sample merged row wind fields: speed={first.get('wind_speed')}, "
-                 f"dir={first.get('wind_direction')}, gusts={first.get('wind_gusts')}")
+                 f"dir={first.get('wind_direction')}, gusts={first.get('wind_gusts')}, "
+                 f"obs_speed={first.get('wind_speed_obs')}, obs_dir={first.get('wind_dir_obs')}")
 
     merged = [sanitise_row(r) for r in merged]
 
@@ -292,6 +374,13 @@ def main():
         log.error(f"Open-Meteo fetch failed: {e}")
         # Not critical — conditions will be upserted without wind columns
 
+    ipma_obs = {}
+    try:
+        ipma_obs = fetch_ipma_obs()
+    except Exception as e:
+        log.error(f"IPMA fetch failed: {e}")
+        # Not critical — conditions will be upserted without observed wind columns
+
     tide_rows = []
     if cmems_rows:
         try:
@@ -302,7 +391,7 @@ def main():
 
     if cmems_rows:
         try:
-            merge_and_upsert(cmems_rows, wind_map, tide_rows)
+            merge_and_upsert(cmems_rows, wind_map, tide_rows, ipma_obs)
         except Exception as e:
             log.error(f"Supabase upsert failed: {e}")
             errors.append(f"Supabase: {e}")
