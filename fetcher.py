@@ -75,6 +75,7 @@ CMEMS_VARS = [
     "VMDR_SW2",
     "VHM0_WW",    # significant height of wind waves (m)
     "VTM01_WW",   # mean wave period of wind waves (s)
+    "VMDR_WW",    # mean direction of wind waves (degrees)
     "VHM0",       # combined significant wave height (m)
 ]
 
@@ -132,8 +133,9 @@ def fetch_cmems() -> list[dict]:
             "swell2_period":    v("VTM01_SW2"),
             "swell2_direction": v("VMDR_SW2"),
             "swell2_energy":    e2,
-            "wind_wave_height": v("VHM0_WW"),
-            "wind_wave_period": v("VTM01_WW"),
+            "wind_wave_height":     v("VHM0_WW"),
+            "wind_wave_period":     v("VTM01_WW"),
+            "wind_wave_direction":  v("VMDR_WW"),
             "wave_height_total":v("VHM0"),
         })
 
