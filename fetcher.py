@@ -17,6 +17,7 @@ Requirements: see requirements.txt
 import os
 import sys
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 import copernicusmarine
@@ -145,6 +146,14 @@ def fetch_cmems() -> list[dict]:
 # ─── IPMA station observations ───────────────────────────────────────────────
 # Station 1200535 = Cabo Carvoeiro (nearest coastal station to Peniche, ~10 km N)
 IPMA_STATION_ID = "1200535"
+
+# IPMA forecast ddVento string labels → degrees
+IPMA_FORECAST_DIR_DEG: dict[str, float] = {
+    "N":  0.0,  "NE": 45.0,  "E":  90.0,  "SE": 135.0,
+    "S": 180.0,  "SW": 225.0,  "W": 270.0,  "NW": 315.0,
+    # Portuguese compass aliases used in some IPMA responses
+    "SO": 225.0,  "O": 270.0,  "NO": 315.0,
+}
 
 # IPMA idDireccVento codes → degrees (0 = calm/variable, 1–8 = N/NE/E/SE/S/SW/W/NW)
 IPMA_DIR_DEG = {
@@ -294,26 +303,51 @@ def fetch_and_store_station_obs() -> int:
     return total
 
 # ─── Open-Meteo wind ─────────────────────────────────────────────────────────
+_OPENMETEO_BACKOFF = [20, 60]   # seconds before attempt 2, then attempt 3
+
 def fetch_openmeteo_wind() -> dict[str, dict]:
     """
     Fetch 10-day hourly wind forecast from Open-Meteo (no auth required).
     Returns dict keyed by UTC ISO hour string → {wind_speed, wind_direction, wind_gusts}.
+    Retries up to 3 times on HTTP 429 / 5xx, honouring Retry-After if present.
     """
     log.info("Fetching Open-Meteo wind forecast…")
-    r = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude":        LAT_PT,
-            "longitude":       LON_PT,
-            "hourly":          "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
-            "wind_speed_unit": "kmh",
-            "forecast_days":   10,
-            "timezone":        "UTC",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude":        LAT_PT,
+        "longitude":       LON_PT,
+        "hourly":          "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+        "wind_speed_unit": "kmh",
+        "forecast_days":   10,
+        "timezone":        "UTC",
+    }
+
+    resp = None
+    for attempt in range(1, len(_OPENMETEO_BACKOFF) + 2):   # attempts 1, 2, 3
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as exc:
+            if attempt > len(_OPENMETEO_BACKOFF):
+                raise
+            wait = _OPENMETEO_BACKOFF[attempt - 1]
+            log.warning(f"  Open-Meteo attempt {attempt} network error: {exc}; retrying in {wait}s")
+            time.sleep(wait)
+            continue
+
+        if resp.ok:
+            break
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt > len(_OPENMETEO_BACKOFF):
+                resp.raise_for_status()   # exhausted retries
+            ra = resp.headers.get("Retry-After", "")
+            wait = min(int(ra), 90) if ra.isdigit() else _OPENMETEO_BACKOFF[attempt - 1]
+            log.warning(f"  Open-Meteo attempt {attempt} → HTTP {resp.status_code}; retrying in {wait}s")
+            time.sleep(wait)
+        else:
+            resp.raise_for_status()   # non-retryable 4xx — fail immediately
+
+    data = resp.json()
 
     hourly = data["hourly"]
     times  = hourly["time"]           # "2026-03-31T06:00" — no tz suffix
@@ -382,7 +416,7 @@ def store_wind_forecast_history(wind_map: dict, issued_at: datetime) -> int:
     for i in range(0, len(rows), 50):
         chunk = rows[i:i+50]
         r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/wind_forecast_history?on_conflict=issued_at,valid_at",
+            f"{SUPABASE_URL}/rest/v1/wind_forecast_history?on_conflict=source,issued_at,valid_at",
             headers={**sb_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
             json=chunk,
             timeout=30,
@@ -396,6 +430,95 @@ def store_wind_forecast_history(wind_map: dict, issued_at: datetime) -> int:
         f"  wind_forecast_history: attempted {total} rows "
         f"(issued_at={issued_at.isoformat()[:16]}Z, ON CONFLICT DO NOTHING)"
     )
+    return total
+
+# ─── IPMA wind forecast ──────────────────────────────────────────────────────
+def fetch_and_store_ipma_forecast() -> int:
+    """
+    Fetch IPMA hourly / 3-hourly wind forecast for Peniche (globalIdLocal 1101400).
+
+    idPeriodo values in the feed:
+      1  → hourly entries  (ffVento present)
+      3  → 3-hourly entries (ffVento present)
+      24 → daily summary   (no ffVento — skipped)
+
+    Inserts into wind_forecast_history with source='ipma'.
+    Uses ON CONFLICT (source, issued_at, valid_at) DO NOTHING.
+    Returns number of rows attempted.
+    """
+    log.info("Fetching IPMA wind forecast → wind_forecast_history…")
+    resp = requests.get(
+        "https://api.ipma.pt/public-data/forecast/aggregate/1101400.json",
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+    unknown_dirs: set[str] = set()
+    for entry in data:
+        if entry.get("idPeriodo") not in (1, 3):
+            continue
+
+        try:
+            valid_at  = datetime.fromisoformat(entry["dataPrev"]).replace(tzinfo=timezone.utc)
+            issued_at = datetime.fromisoformat(entry["dataUpdate"]).replace(tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            continue
+
+        # Wind speed — stored as a string; -99 / "-99.0" → NULL
+        ff_raw = entry.get("ffVento")
+        wind_speed = None
+        if ff_raw is not None:
+            try:
+                f = float(ff_raw)
+                wind_speed = None if f == -99.0 else round(f, 1)
+            except (TypeError, ValueError):
+                pass
+
+        # Wind direction — string compass label
+        dd = entry.get("ddVento")
+        if dd is None:
+            wind_dir = None
+        elif dd in IPMA_FORECAST_DIR_DEG:
+            wind_dir = IPMA_FORECAST_DIR_DEG[dd]
+        else:
+            if dd not in unknown_dirs:
+                log.warning(f"  IPMA forecast: unknown ddVento {dd!r} → NULL")
+                unknown_dirs.add(dd)
+            wind_dir = None
+
+        lead_h = round((valid_at.timestamp() - issued_at.timestamp()) / 3600, 1)
+
+        rows.append({
+            "source":         "ipma",
+            "issued_at":      issued_at.isoformat(),
+            "valid_at":       valid_at.isoformat(),
+            "lead_hours":     lead_h,
+            "wind_speed_kmh": wind_speed,
+            "wind_dir_deg":   wind_dir,
+            "wind_gusts_kmh": None,
+        })
+
+    if not rows:
+        log.info("  IPMA forecast: no rows to insert")
+        return 0
+
+    total = 0
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i+50]
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/wind_forecast_history?on_conflict=source,issued_at,valid_at",
+            headers={**sb_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json=chunk,
+            timeout=30,
+        )
+        if not r.ok:
+            log.error(f"  Supabase {r.status_code} on wind_forecast_history (ipma): {r.text[:500]}")
+        r.raise_for_status()
+        total += len(chunk)
+
+    log.info(f"  IPMA forecast: attempted {total} rows into wind_forecast_history")
     return total
 
 # ─── Tides from Supabase ─────────────────────────────────────────────────────
@@ -531,7 +654,12 @@ def main():
         wind_map = fetch_openmeteo_wind()
     except Exception as e:
         log.error(f"Open-Meteo fetch failed: {e}")
-        # Not critical — conditions will be upserted without wind columns
+
+    if not wind_map:
+        log.warning(
+            "Open-Meteo wind data unavailable — wind_speed / wind_direction / wind_gusts "
+            "will be omitted from the conditions upsert; existing DB values are preserved"
+        )
 
     ipma_obs = {}
     try:
@@ -566,8 +694,14 @@ def main():
         try:
             store_wind_forecast_history(wind_map, now)
         except Exception as e:
-            log.error(f"wind_forecast_history failed: {e}")
+            log.error(f"wind_forecast_history (open-meteo) failed: {e}")
             # Not critical — conditions and tide writes are already complete above
+
+    try:
+        fetch_and_store_ipma_forecast()
+    except Exception as e:
+        log.error(f"wind_forecast_history (ipma) failed: {e}")
+        # Not critical — conditions and tide writes are already complete above
 
     if errors:
         log.error("Completed with errors: " + "; ".join(errors))
