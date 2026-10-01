@@ -2,8 +2,8 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Runs every 3 hours on the hour
-cronSchedule = "0 */3 * * *"
+# Full run every 3 hours; obs-only every other hour. Both at :15 past.
+cronSchedule = "15 * * * *"
 startCommand = "python fetcher.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3

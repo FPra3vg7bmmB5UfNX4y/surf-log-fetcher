@@ -157,7 +157,7 @@ IPMA_FORECAST_DIR_DEG: dict[str, float] = {
 
 # IPMA idDireccVento codes → degrees
 # 0 = calm/variable (no meaningful direction), 1–8 = N/NE/E/SE/S/SW/W/NW
-# 9 = N (confirmed: most common code in station data, correlates with northerly forecasts)
+# 9 = N (inferred: most common code in station data, correlates with northerly forecasts)
 IPMA_DIR_DEG: dict[int, float | None] = {
     0: None,    # calm / variable
     1: 0.0,     # N
@@ -209,6 +209,30 @@ def fetch_ipma_obs() -> dict[str, dict]:
 
     log.info(f"  → {len(obs_map)} IPMA observation time steps")
     return obs_map
+
+def _best_obs(obs_map: dict) -> "tuple[datetime, dict] | None":
+    """Return (obs_dt, obs_dict) for the newest obs with non-null wind_speed_obs, or None."""
+    best_dt: datetime | None = None
+    best: dict | None = None
+    for ts_str, obs in obs_map.items():
+        if obs.get("wind_speed_obs") is None:
+            continue
+        dt = datetime.fromisoformat(ts_str)
+        if best_dt is None or dt > best_dt:
+            best_dt, best = dt, obs
+    return (best_dt, best) if best_dt is not None else None
+
+def _log_obs_attached(obs_at: datetime, obs: dict, now: datetime, valid_ats: list) -> None:
+    age_min = round((now.timestamp() - obs_at.timestamp()) / 60)
+    spd = obs.get("wind_speed_obs")
+    d   = obs.get("wind_dir_obs")
+    spd_str = f"{spd} km/h" if spd is not None else "null"
+    dir_str = f"{d}°"       if d   is not None else "variable"
+    rows_str = ", ".join(valid_ats)
+    log.info(
+        f"  OBS attached: {spd_str} {dir_str} observed at "
+        f"{obs_at.isoformat()[:16]}Z ({age_min} min old) → rows {rows_str}"
+    )
 
 # ─── station_observations ────────────────────────────────────────────────────
 def _nm(station: dict, key: str, decimals: int = 1):
@@ -572,7 +596,7 @@ def sanitise_row(row: dict) -> dict:
 
 # ─── Merge & upsert ──────────────────────────────────────────────────────────
 def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dict],
-                     ipma_obs: dict):
+                     ipma_obs: dict, now: datetime):
     """Merge CMEMS + Open-Meteo wind + IPMA obs + tides by valid_at, upsert to conditions table."""
 
     # Build tide lookup: nearest tide to each timestamp
@@ -583,18 +607,27 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         best = min(tide_rows, key=lambda r: abs(datetime.fromisoformat(r["valid_at"]).timestamp() - target))
         return {k: best[k] for k in ["tide_height","tide_state","tide_phase","tide_next_type","tide_next_height"]}
 
-    def nearest_ipma(ts_iso: str) -> dict:
-        """Return IPMA obs for ts_iso only if within 1.5 h; else empty (no obs for future rows)."""
-        if not ipma_obs:
-            return {}
-        target = datetime.fromisoformat(ts_iso).timestamp()
-        best_key = min(ipma_obs.keys(), key=lambda k: abs(datetime.fromisoformat(k).timestamp() - target))
-        delta_h = abs(datetime.fromisoformat(best_key).timestamp() - target) / 3600
-        return ipma_obs[best_key] if delta_h <= 1.5 else {}
+    # Find newest IPMA obs with non-null wind speed and the two target valid_at rows
+    best = _best_obs(ipma_obs)
+    obs_target_valid_ats: set[str] = set()
+    obs_payload: dict = {}
+    if best:
+        obs_at, obs_dict = best
+        obs_payload = {**obs_dict, "wind_obs_at": obs_at.isoformat()}
+        now_ep = now.timestamp()
+        past   = [r for r in cmems_rows
+                  if datetime.fromisoformat(r["valid_at"]).timestamp() <= now_ep]
+        future = [r for r in cmems_rows
+                  if datetime.fromisoformat(r["valid_at"]).timestamp() >  now_ep]
+        if past:
+            obs_target_valid_ats.add(
+                max(past,   key=lambda r: datetime.fromisoformat(r["valid_at"]).timestamp())["valid_at"])
+        if future:
+            obs_target_valid_ats.add(
+                min(future, key=lambda r: datetime.fromisoformat(r["valid_at"]).timestamp())["valid_at"])
 
     merged = []
     wind_hits = 0
-    ipma_hits = 0
     for row in cmems_rows:
         ts = row["valid_at"]  # e.g. "2026-03-31T06:00:00+00:00"
 
@@ -604,20 +637,15 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
         if wind:
             wind_hits += 1
 
-        obs = nearest_ipma(ts)
-        if obs:
-            ipma_hits += 1
-
-        tide = nearest_tide(ts)
-        merged.append({**row, **wind, **obs, **tide})
+        row_obs = obs_payload if ts in obs_target_valid_ats else {}
+        tide    = nearest_tide(ts)
+        merged.append({**row, **wind, **row_obs, **tide})
 
     log.info(f"  Wind matched {wind_hits}/{len(cmems_rows)} CMEMS rows")
-    log.info(f"  IPMA obs matched {ipma_hits}/{len(cmems_rows)} CMEMS rows")
-    if merged:
-        first = merged[0]
-        log.info(f"  Sample merged row wind fields: speed={first.get('wind_speed')}, "
-                 f"dir={first.get('wind_direction')}, gusts={first.get('wind_gusts')}, "
-                 f"obs_speed={first.get('wind_speed_obs')}, obs_dir={first.get('wind_dir_obs')}")
+    if best:
+        _log_obs_attached(obs_at, obs_dict, now, sorted(obs_target_valid_ats))
+    else:
+        log.warning("  No attachable IPMA obs (all null wind speed)")
 
     merged = [sanitise_row(r) for r in merged]
 
@@ -630,14 +658,96 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
     for i in range(0, len(merged), 50):
         sb_upsert("conditions", merged[i:i+50])
 
+# ─── Obs-only helpers ─────────────────────────────────────────────────────────
+def patch_conditions_obs(obs_at: datetime, obs: dict, now: datetime) -> list:
+    """
+    PATCH wind_speed_obs / wind_dir_obs / wind_gusts_obs / wind_obs_at onto
+    exactly two conditions rows: latest valid_at <= now and first valid_at > now.
+    CMEMS rows are on 3 h UTC boundaries so we compute the targets arithmetically.
+    Only the four obs columns are written — no other column is touched.
+    Returns list of valid_at strings that were patched.
+    """
+    THREE_H = 3 * 3600
+    floor_ep = (now.timestamp() // THREE_H) * THREE_H
+    targets = [
+        datetime.fromtimestamp(floor_ep,            tz=timezone.utc),  # latest <= now
+        datetime.fromtimestamp(floor_ep + THREE_H,  tz=timezone.utc),  # first  >  now
+    ]
+
+    obs_s = sanitise_row(obs)
+    patch_body = {
+        "wind_speed_obs": obs_s["wind_speed_obs"],
+        "wind_dir_obs":   obs_s["wind_dir_obs"],
+        "wind_gusts_obs": obs_s["wind_gusts_obs"],
+        "wind_obs_at":    obs_at.isoformat(),
+    }
+
+    patched_valid_ats = []
+    for target_dt in targets:
+        valid_at_enc = target_dt.isoformat().replace("+", "%2B")
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/conditions?valid_at=eq.{valid_at_enc}",
+            headers={**sb_headers(), "Prefer": "return=minimal"},
+            json=patch_body,
+            timeout=30,
+        )
+        if not r.ok:
+            log.error(
+                f"  PATCH conditions {target_dt.isoformat()[:16]}Z: "
+                f"{r.status_code} {r.text[:200]}"
+            )
+            r.raise_for_status()
+        patched_valid_ats.append(target_dt.isoformat()[:16] + "Z")
+
+    return patched_valid_ats
+
+def run_obs_only(now: datetime) -> None:
+    """
+    Lightweight hourly run: fetch IPMA observations, store to station_observations,
+    and PATCH the four obs fields onto the two target conditions rows.
+    Exits non-zero on any failure so Railway marks the run as failed.
+    """
+    log.info("Mode: obs-only")
+
+    try:
+        obs_map = fetch_ipma_obs()
+    except Exception as e:
+        log.error(f"IPMA fetch failed: {e}")
+        sys.exit(1)
+
+    best = _best_obs(obs_map)
+    if best is None:
+        log.warning("  No attachable IPMA obs (all null wind speed)")
+
+    try:
+        fetch_and_store_station_obs()
+    except Exception as e:
+        log.error(f"station_observations failed: {e}")
+        sys.exit(1)
+
+    if best:
+        obs_at, obs_dict = best
+        try:
+            valid_ats = patch_conditions_obs(obs_at, obs_dict, now)
+            _log_obs_attached(obs_at, obs_dict, now, valid_ats)
+        except Exception as e:
+            log.error(f"PATCH conditions obs failed: {e}")
+            sys.exit(1)
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     now = datetime.now(timezone.utc)
+    obs_only = (now.hour % 3 != 0)
 
     log.info("=" * 60)
     log.info("Peniche Surf Log — Fetcher starting")
-    log.info(f"Run time: {now.isoformat()}")
+    log.info(f"Run time: {now.isoformat()}  mode={'obs-only' if obs_only else 'full'}")
     log.info("=" * 60)
+
+    if obs_only:
+        run_obs_only(now)
+        log.info("✓ Obs-only run completed successfully")
+        return
 
     errors = []
 
@@ -677,7 +787,7 @@ def main():
 
     if cmems_rows:
         try:
-            merge_and_upsert(cmems_rows, wind_map, tide_rows, ipma_obs)
+            merge_and_upsert(cmems_rows, wind_map, tide_rows, ipma_obs, now)
         except Exception as e:
             log.error(f"Supabase upsert failed: {e}")
             errors.append(f"Supabase: {e}")
