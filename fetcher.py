@@ -199,6 +199,100 @@ def fetch_ipma_obs() -> dict[str, dict]:
     log.info(f"  → {len(obs_map)} IPMA observation time steps")
     return obs_map
 
+# ─── station_observations ────────────────────────────────────────────────────
+def _nm(station: dict, key: str, decimals: int = 1):
+    """Get a numeric field from a station dict; convert -99 / -99.0 → None."""
+    raw = station.get(key)
+    if raw is None:
+        return None
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return None if f == -99.0 else round(f, decimals)
+
+def fetch_and_store_station_obs() -> int:
+    """
+    Fetch IPMA observations.json, keep only station 1200535, convert -99/-99.0
+    to NULL in every field, store raw wind_dir_code and computed wind_dir_deg,
+    then upsert into station_observations on (station_id, observed_at).
+    Returns number of rows upserted.
+    """
+    log.info("Fetching IPMA observations → station_observations table…")
+    resp = requests.get(
+        "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json",
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for ts_str, stations in data.items():
+        # Skip null/empty timestamp buckets
+        if not stations:
+            continue
+        station = stations.get(IPMA_STATION_ID)
+        # Skip null station entries
+        if not station:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+        except ValueError:
+            log.warning(f"  station_obs: bad timestamp {ts_str!r}, skipping")
+            continue
+
+        # Wind direction code: apply -99 → None, keep 0 as valid code
+        dir_raw = station.get("idDireccVento")
+        dir_code = None
+        if dir_raw is not None:
+            try:
+                dc = int(dir_raw)
+                dir_code = None if dc == -99 else dc
+            except (TypeError, ValueError):
+                pass
+
+        # wind_dir_deg: codes 1-8 → (code-1)*45; code 0 and code 9 → NULL
+        if dir_code is not None and 1 <= dir_code <= 8:
+            wind_dir_deg = float((dir_code - 1) * 45)
+        else:
+            wind_dir_deg = None
+
+        rows.append({
+            "station_id":     IPMA_STATION_ID,
+            "observed_at":    dt.isoformat(),
+            "wind_speed_kmh": _nm(station, "intensidadeVentoKM"),
+            "wind_dir_code":  dir_code,
+            "wind_dir_deg":   wind_dir_deg,
+            "temp_c":         _nm(station, "temperatura"),
+            "humidity_pct":   _nm(station, "humidade"),
+            "pressure_hpa":   _nm(station, "pressao"),
+            "radiation":      _nm(station, "radiacao"),
+            "fetched_at":     now.isoformat(),
+        })
+
+    if not rows:
+        log.info("  station_observations: no data for station 1200535")
+        return 0
+
+    total = 0
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i+50]
+        r2 = requests.post(
+            f"{SUPABASE_URL}/rest/v1/station_observations?on_conflict=station_id,observed_at",
+            headers={**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=chunk,
+            timeout=30,
+        )
+        if not r2.ok:
+            log.error(f"  Supabase {r2.status_code} on station_observations: {r2.text[:500]}")
+        r2.raise_for_status()
+        total += len(chunk)
+
+    log.info(f"  station_observations: upserted {total} rows for station {IPMA_STATION_ID}")
+    return total
+
 # ─── Open-Meteo wind ─────────────────────────────────────────────────────────
 def fetch_openmeteo_wind() -> dict[str, dict]:
     """
@@ -242,6 +336,67 @@ def fetch_openmeteo_wind() -> dict[str, dict]:
         sample_key = next(iter(wind_map))
         log.info(f"  Sample wind entry: {sample_key} → {wind_map[sample_key]}")
     return wind_map
+
+# ─── wind_forecast_history ────────────────────────────────────────────────────
+def store_wind_forecast_history(wind_map: dict, issued_at: datetime) -> int:
+    """
+    Insert the next 48 h of Open-Meteo wind forecast into wind_forecast_history.
+
+    issued_at is the **fetch time** — Open-Meteo does not expose its model-run
+    time in the API response, so we use the time this script fetched the data.
+
+    Uses ON CONFLICT (issued_at, valid_at) DO NOTHING so re-runs are safe.
+    Returns number of rows attempted (some may be no-ops due to the conflict rule).
+    """
+    log.info("Writing wind forecast history…")
+    cutoff = issued_at + timedelta(hours=48)
+
+    rows = []
+    for ts_str, w in wind_map.items():
+        try:
+            valid_at = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if valid_at.tzinfo is None:
+            valid_at = valid_at.replace(tzinfo=timezone.utc)
+        if valid_at > cutoff:
+            continue
+
+        lead_h = round((valid_at.timestamp() - issued_at.timestamp()) / 3600, 1)
+
+        rows.append({
+            "issued_at":      issued_at.isoformat(),
+            "valid_at":       valid_at.isoformat(),
+            "lead_hours":     lead_h,
+            "wind_speed_kmh": w.get("wind_speed"),
+            "wind_dir_deg":   w.get("wind_direction"),
+            "wind_gusts_kmh": w.get("wind_gusts"),
+            "source":         "open-meteo",
+        })
+
+    if not rows:
+        log.info("  wind_forecast_history: no rows to insert")
+        return 0
+
+    total = 0
+    for i in range(0, len(rows), 50):
+        chunk = rows[i:i+50]
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/wind_forecast_history?on_conflict=issued_at,valid_at",
+            headers={**sb_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json=chunk,
+            timeout=30,
+        )
+        if not r.ok:
+            log.error(f"  Supabase {r.status_code} on wind_forecast_history: {r.text[:500]}")
+        r.raise_for_status()
+        total += len(chunk)
+
+    log.info(
+        f"  wind_forecast_history: attempted {total} rows "
+        f"(issued_at={issued_at.isoformat()[:16]}Z, ON CONFLICT DO NOTHING)"
+    )
+    return total
 
 # ─── Tides from Supabase ─────────────────────────────────────────────────────
 def fetch_tides_from_db(start_iso: str, end_iso: str) -> list[dict]:
@@ -355,9 +510,11 @@ def merge_and_upsert(cmems_rows: list[dict], wind_map: dict, tide_rows: list[dic
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    now = datetime.now(timezone.utc)
+
     log.info("=" * 60)
     log.info("Peniche Surf Log — Fetcher starting")
-    log.info(f"Run time: {datetime.now(timezone.utc).isoformat()}")
+    log.info(f"Run time: {now.isoformat()}")
     log.info("=" * 60)
 
     errors = []
@@ -397,6 +554,20 @@ def main():
         except Exception as e:
             log.error(f"Supabase upsert failed: {e}")
             errors.append(f"Supabase: {e}")
+
+    # ── New tables ────────────────────────────────────────────────────────────
+    try:
+        fetch_and_store_station_obs()
+    except Exception as e:
+        log.error(f"station_observations failed: {e}")
+        # Not critical — conditions and tide writes are already complete above
+
+    if wind_map:
+        try:
+            store_wind_forecast_history(wind_map, now)
+        except Exception as e:
+            log.error(f"wind_forecast_history failed: {e}")
+            # Not critical — conditions and tide writes are already complete above
 
     if errors:
         log.error("Completed with errors: " + "; ".join(errors))
