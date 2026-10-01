@@ -155,18 +155,20 @@ IPMA_FORECAST_DIR_DEG: dict[str, float] = {
     "SO": 225.0,  "O": 270.0,  "NO": 315.0,
 }
 
-# IPMA idDireccVento codes → degrees (0 = calm/variable, 1–8 = N/NE/E/SE/S/SW/W/NW)
-IPMA_DIR_DEG = {
-    0: None,   # calm / variable — no meaningful direction
-    1: 0.0,    # N
-    2: 45.0,   # NE
-    3: 90.0,   # E
-    4: 135.0,  # SE
-    5: 180.0,  # S
-    6: 225.0,  # SW
-    7: 270.0,  # W
-    8: 315.0,  # NW
-    9: 0.0,    # N (some IPMA schemas repeat N as 9)
+# IPMA idDireccVento codes → degrees
+# 0 = calm/variable (no meaningful direction), 1–8 = N/NE/E/SE/S/SW/W/NW
+# 9 = N (confirmed: most common code in station data, correlates with northerly forecasts)
+IPMA_DIR_DEG: dict[int, float | None] = {
+    0: None,    # calm / variable
+    1: 0.0,     # N
+    2: 45.0,    # NE
+    3: 90.0,    # E
+    4: 135.0,   # SE
+    5: 180.0,   # S
+    6: 225.0,   # SW
+    7: 270.0,   # W
+    8: 315.0,   # NW
+    9: 0.0,     # N
 }
 
 def fetch_ipma_obs() -> dict[str, dict]:
@@ -262,11 +264,8 @@ def fetch_and_store_station_obs() -> int:
             except (TypeError, ValueError):
                 pass
 
-        # wind_dir_deg: codes 1-8 → (code-1)*45; code 0 and code 9 → NULL
-        if dir_code is not None and 1 <= dir_code <= 8:
-            wind_dir_deg = float((dir_code - 1) * 45)
-        else:
-            wind_dir_deg = None
+        # wind_dir_deg: use shared IPMA_DIR_DEG (0 → NULL, 1-8 → compass, 9 → N)
+        wind_dir_deg = IPMA_DIR_DEG.get(dir_code) if dir_code is not None else None
 
         rows.append({
             "station_id":     IPMA_STATION_ID,
