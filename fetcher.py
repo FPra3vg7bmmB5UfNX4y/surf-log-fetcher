@@ -18,6 +18,7 @@ import os
 import sys
 import logging
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 
 import copernicusmarine
@@ -735,14 +736,51 @@ def run_obs_only(now: datetime) -> None:
             sys.exit(1)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
+def _newest_conditions_fetched_at() -> "datetime | None":
+    """Read the newest fetched_at from conditions. Returns None on any failure."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/conditions?select=fetched_at&fetched_at=not.is.null&order=fetched_at.desc&limit=1",
+            headers=sb_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows or not rows[0].get("fetched_at"):
+            return None
+        dt = datetime.fromisoformat(rows[0]["fetched_at"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception as e:
+        log.warning(f"Could not read conditions fetched_at: {e}")
+        return None
+
+
 def main():
     now = datetime.now(timezone.utc)
-    obs_only = (now.hour % 3 != 0)
 
     log.info("=" * 60)
     log.info("Peniche Surf Log — Fetcher starting")
-    log.info(f"Run time: {now.isoformat()}  mode={'obs-only' if obs_only else 'full'}")
+    log.info(f"Run time: {now.isoformat()}")
     log.info("=" * 60)
+
+    if now.hour % 3 != 0:
+        newest_fetched = _newest_conditions_fetched_at()
+        if newest_fetched is None:
+            obs_only = True
+            log.info("Mode: obs-only (conditions fetched_at unreadable — defaulting to obs-only)")
+        else:
+            age_h = (now.timestamp() - newest_fetched.timestamp()) / 3600
+            if age_h > 3.5:
+                obs_only = False
+                log.info(f"Mode: full (self-heal — conditions stale: {age_h:.1f}h since last fetch)")
+            else:
+                obs_only = True
+                log.info(f"Mode: obs-only (conditions fresh: {age_h:.1f}h old)")
+    else:
+        obs_only = False
+        log.info("Mode: full (scheduled 3h slot)")
 
     if obs_only:
         run_obs_only(now)
@@ -754,7 +792,10 @@ def main():
     try:
         cmems_rows = fetch_cmems()
     except Exception as e:
-        log.error(f"CMEMS fetch failed: {e}")
+        log.error(
+            "CMEMS fetch failed: %s: %r\n%s",
+            type(e).__name__, e, traceback.format_exc(limit=5).rstrip(),
+        )
         errors.append(f"CMEMS: {e}")
         cmems_rows = []
 
